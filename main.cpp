@@ -39,11 +39,9 @@ std::condition_variable cv;
 std::atomic<result_t> result;
 std::atomic<bool> finished;
 std::atomic<bool> success;
-std::atomic<int> closest_bits;
-std::atomic<git_oid> closest;
 std::atomic<uint64_t> attempts;
 
-void try_commits(size_t i, size_t threads, size_t bits, char *base_body, size_t base_size) {
+void try_commits(size_t i, size_t threads, const unsigned char *const prefix, const size_t prefix_len, char *base_body, size_t base_size) {
 	// We need to modify the original commit data to add a nonce for brute forcing
 	// But where do we do that?
 	// - If the commit is not GPG signed, we can just add an extra field into the commit
@@ -214,14 +212,10 @@ I should not be allowed near this
 	EVP_MD_CTX *md_ctx = EVP_MD_CTX_new();
 	EVP_DigestInit_ex(md_ctx, EVP_sha1(), nullptr);
 
-	// Local copies of atomics because gotta go fast
-	uint8_t good_bits;
-	uint8_t local_closest = 0;
-
 	// I hope 64 bits is enough
 	uint64_t nonce = 0;
 
-	do {
+	while(1) {
 		// See if another thread got it
 		if (finished)
 			return;
@@ -261,31 +255,8 @@ I should not be allowed near this
 		// If it's not 20 then we just demolished the stack lmao
 		assert(md_len == 20);
 
-		// Make sure it matches
-		good_bits = 0;
-#if defined(HAVE_FLSLL)
-		// Nobody is going to ask for more than 64 bits
-		assert(bits <= 64);
-		good_bits = 64 - flsll(htonll(*(uint64_t *)&hash.id[0]));
-#else
-		int still_good = 1;
-		for (int n = 0; n < bits; n++) {
-			// 1 if the bit `n` is unset
-			int bit = ((hash.id[n / 8] >> (7 - (n % 8))) & 1) ^ 1;
-			// Will be 1 as long as no bits were set
-			still_good &= bit;
-			// Will add 1 as long as no bits were set
-			good_bits += still_good;
-		}
-#endif
-		// Only update atomics if we PB because speed
-		if (good_bits > local_closest) {
-			local_closest = good_bits;
-			if (good_bits > closest_bits) {
-				closest_bits = good_bits;
-				closest = hash;
-			}
-		}
+		if (!memcmp(hash.id, prefix, prefix_len >> 1) && (!(prefix_len & 1) || (hash.id[prefix_len >> 1] & 0xf0) == prefix[prefix_len >> 1]))
+			break;
 
 		// Update attempts every 0x100. Probably not a big impact but I am going to
 		// micro-optimize every part of this.
@@ -293,19 +264,7 @@ I should not be allowed near this
 			attempts += 0x100;
 		}
 		nonce++;
-	} while (good_bits < bits);
-
-	// Big sanity check here since we think this is a good hash
-	git_oid hash;
-	git_odb_hash(&hash, commit_buf, commit_size, GIT_OBJECT_COMMIT);
-	int test = 0;
-	for (size_t n = 0; n < bits; n++) {
-		// Test will be the OR of the first `n` bits
-		test |= (hash.id[n / 8] >> (7 - (n % 8))) & 1;
 	}
-
-	// Hopefully this never fails
-	assert(test == 0);
 
 	// Report results WHILE HOLDING THE LOCK
 	{
@@ -337,15 +296,42 @@ void sigint_handler(int sig) {
 
 int main(int argc, const char **argv) {
 	// Arg parsing could be improved
-	if (argc == 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)) {
-		fprintf(stderr, "Usage: %s [bits [threads]]\n", argv[0]);
+	if (argc < 2 || (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-?") == 0)) {
+		fprintf(stderr, "Usage: %s <hex prefix> [threads]\n", argv[0]);
 		return 1;
 	}
+
+	const auto prefix_len = strlen(argv[1]);
+	if (prefix_len < 1 || prefix_len > 16) {
+		fprintf(stderr, "Prefix must be 1-16 hex characters\n");
+		return 1;
+	}
+
+	auto *const prefix = new unsigned char[(prefix_len + 1) >> 1];
+	for (size_t i = 0; i < prefix_len; i++) {
+		auto c = argv[1][i];
+		if (c >= '0' && c <= '9') {
+			c -= '0';
+		} else {
+			c |= ' ';
+			if (c >= 'a' && c <= 'f') {
+				c -= 'a';
+				c += 10;
+			} else {
+				fprintf(stderr, "Non-hex character in prefix\n");
+				return 1;
+			}
+		}
+
+		if (i & 1) {
+			prefix[i >> 1] |= c;
+		} else {
+			prefix[i >> 1] = (unsigned char)(c << 4);
+		}
+	}
+
 	// Sensible defaults
-	int bits = 32;
 	int threads = std::max((int)std::thread::hardware_concurrency(), 1);
-	if (argc > 1)
-		sscanf(argv[1], "%d", &bits);
 	if (argc > 2)
 		sscanf(argv[2], "%d", &threads);
 
@@ -426,37 +412,34 @@ int main(int argc, const char **argv) {
 	attempts = 0;
 	auto start = std::chrono::high_resolution_clock::now();
 
-	std::unique_lock<std::mutex> lk(m);
-	signal(SIGINT, &sigint_handler);
-
 	std::vector<std::thread> spawned_threads;
 
-	// Start!!!
-	for (size_t i = 0; i < threads; i++) {
-		spawned_threads.emplace_back([=]() {
-			try_commits(i, threads, bits, (char *)git_odb_object_data(commit_data),
-			            git_odb_object_size(commit_data));
-		});
-	}
+	{
+		std::unique_lock<std::mutex> lk(m);
+		signal(SIGINT, &sigint_handler);
 
-	// A thread will signal this when it finds a match
-	while (!finished) {
-		cv.wait_for(lk, std::chrono::seconds(1));
+		// Start!!!
+		for (size_t i = 0; i < threads; i++) {
+			spawned_threads.emplace_back([=]() {
+				try_commits(i, threads, prefix, prefix_len, (char*)git_odb_object_data(commit_data),
+					git_odb_object_size(commit_data));
+			});
+		}
 
-		git_oid close = closest;
-		uint64_t a = attempts;
-		int b = closest_bits;
+		// A thread will signal this when it finds a match
+		while (!finished) {
+			cv.wait_for(lk, std::chrono::seconds(1));
 
-		char id[0x100];
-		git_oid_tostr(id, 0x100, &close);
+			uint64_t a = attempts;
 
-		auto end = std::chrono::high_resolution_clock::now();
-		auto difference = end - start;
+			auto end = std::chrono::high_resolution_clock::now();
+			auto difference = end - start;
 
-		fprintf(stderr, "\rRuns: %12llu Best found: %s (%d/%d bits) Time: %lld.%06lld ~%fMH/s", a, id,
-		        b, bits, std::chrono::duration_cast<std::chrono::seconds>(difference).count(),
-		        std::chrono::duration_cast<std::chrono::microseconds>(difference).count() % 1000000,
-		        (double)a / (double)std::chrono::duration_cast<std::chrono::microseconds>(difference).count());
+			fprintf(stderr, "\rRuns: %12llu Time: %lld.%06lld ~%fMH/s", a,
+			        std::chrono::duration_cast<std::chrono::seconds>(difference).count(),
+			        std::chrono::duration_cast<std::chrono::microseconds>(difference).count() % 1000000,
+			        (double)a / (double)std::chrono::duration_cast<std::chrono::microseconds>(difference).count());
+		}
 	}
 
 	// Wait for threads
